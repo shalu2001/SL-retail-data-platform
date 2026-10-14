@@ -1,0 +1,39 @@
+name: Daily Supermarket Ingestion
+
+on:
+    schedule:
+        # 01:00 UTC corresponds to 06:30 AM SLST (Asia/Colombo)
+        - cron: "0 1 * * *"
+    workflow_dispatch: # Allows manual trigger from GitHub UI for testing
+
+jobs:
+    ingest:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout Code
+              uses: actions/checkout@v4
+
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.11"
+                  cache: "pip"
+
+            - name: Install Dependencies
+              run: |
+                  pip install --upgrade pip
+                  pip install -r requirements.txt
+
+            - name: Run Daily Scrapers
+              run: |
+                  python -m pipeline.daily_ingestion
+
+            - name: Upload Raw Snapshots to Cloudflare R2
+              env:
+                  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+                  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+                  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+                  R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+              run: |
+                  python -m pipeline.r2_uploader

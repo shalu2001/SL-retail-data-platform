@@ -1,423 +1,170 @@
-import asyncio
-import re
-from datetime import datetime
+from datetime import datetime, timezone
+import gzip
+import json
+import logging
+from pathlib import Path
+import time
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
-
 import requests
-from playwright.async_api import async_playwright
 
-
-BASE_URL = "https://www.keellssuper.com"
+logger = logging.getLogger(__name__)
 SL_TIMEZONE = ZoneInfo("Asia/Colombo")
 
 
-def discover_itemcodes():
-    """
-    Get Keells product itemcodes from sitemap.xml.
-    """
+class KeellsScraper:
+    BASE_URL = "https://zebraliveback.keellssuper.com"
 
-    sitemap_url = (
-        f"{BASE_URL}/sitemap.xml"
-    )
+    def __init__(self, outlet_code: str = "SCDR    ", request_timeout: int = 20):
+        self.outlet_code = outlet_code
+        self.timeout = request_timeout
+        self.session = requests.Session()
+        self.session_id: Optional[str] = None
 
-    response = requests.get(
-        sitemap_url,
-        headers={
-            "User-Agent": "Mozilla/5.0"
-        },
-        timeout=30
-    )
+        self.session.headers.update({
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "en-GB,en;q=0.9",
+            "origin": "https://www.keellssuper.com",
+            "referer": "https://www.keellssuper.com/",
+            "user-agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+        })
 
-    response.raise_for_status()
+    def authenticate(self) -> str:
+        """Obtains a new guest userSessionID from the backend login service."""
+        url = f"{self.BASE_URL}/1.0/Login/GuestLogin"
+        logger.info("Requesting fresh guest session token...")
 
-    html = response.text
+        resp = self.session.post(url, headers={"content-length": "0"}, timeout=self.timeout)
+        resp.raise_for_status()
+        data = resp.json()
 
-    pattern = re.compile(
-        r"<loc>\s*"
-        r"https?://(?:www\.)?keellssuper\.com/"
-        r"productDetail\?itemcode=(\d+)"
-        r"(?:&amp;|&)([^<]+)"
-        r"</loc>",
-        flags=re.IGNORECASE
-    )
+        session_id = data.get("result", {}).get("userSessionID")
+        if not session_id:
+            raise ValueError(f"Failed to extract userSessionID from GuestLogin: {data}")
 
-    items = {}
+        self.session_id = session_id
+        self.session.headers["usersessionid"] = self.session_id
+        self.session.headers["sessionid"] = self.session_id
+        logger.info("Acquired Keells session: %s", self.session_id)
+        return self.session_id
 
-    for itemcode, raw_name in pattern.findall(
-        html
-    ):
+    def _fetch_page(self, page_no: int, items_per_page: int) -> Dict[str, Any]:
+        """Fetches a page with retry logic for handling unexpected session expiry."""
+        if not self.session_id:
+            self.authenticate()
 
-        name = (
-            raw_name
-            .replace("_", " ")
-            .replace("%20", " ")
-            .strip()
-        )
-
-        items[itemcode] = {
-            "itemcode": itemcode,
-            "name_from_sitemap": name,
+        url = f"{self.BASE_URL}/2.0/WebV2/GetItemDetails"
+        params = {
+            "pageNo": page_no,
+            "itemsPerPage": items_per_page,
+            "outletCode": self.outlet_code,
+            "departmentId": "",
+            "subDepartmentId": "",
+            "categoryId": "",
+            "itemDescription": "    ",
+            "itemPricefrom": 0,
+            "itemPriceTo": 500000,
+            "isFeatured": 0,
+            "isPromotionOnly": "false    ",
+            "promotionCategory": "",
+            "sortBy": "default",
+            "BrandId": "",
+            "storeName": "    ",
+            "subDeaprtmentCode": "",
+            "isShowOutofStockItems": "true",
+            "brandName": "",
         }
 
-    return list(items.values())
-
-
-async def scrape_product(
-    page,
-    itemcode,
-    name_from_sitemap=None
-):
-    """
-    Open one Keells product page in Chromium
-    and extract name, price and availability.
-    """
-
-    url = (
-        f"{BASE_URL}"
-        f"/productDetail?itemcode={itemcode}"
-    )
-
-    try:
-
-        response = await page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=60000
-        )
-
-        if response is None:
-            return None
-
-        if response.status != 200:
-
-            print(
-                f"    HTTP {response.status}"
-            )
-
-            return {
-                "store": "keells",
-                "product_id": str(itemcode),
-                "sku": str(itemcode),
-                "product_name": name_from_sitemap,
-                "price": None,
-                "availability": "Unknown",
-                "observed_at": (
-                    datetime.now(
-                        SL_TIMEZONE
-                    ).isoformat()
-                ),
-                "source_url": url,
-                "http_status": response.status,
-            }
-
-        # Wait for the rendered content
-        await page.wait_for_timeout(
-            2000
-        )
-
-        body_text = await page.locator(
-            "body"
-        ).inner_text()
-
-        lines = [
-            line.strip()
-            for line in body_text.splitlines()
-            if line.strip()
-        ]
-
-        # ----------------------------------
-        # PRICE
-        # ----------------------------------
-
-        price = None
-        product_name = None
-
-        for index, line in enumerate(
-            lines
-        ):
-
-            match = re.match(
-                r"^Rs\.?\s*"
-                r"([\d,]+(?:\.\d{1,2})?)$",
-                line,
-                flags=re.IGNORECASE
-            )
-
-            if match:
-
-                price = float(
-                    match.group(1)
-                    .replace(",", "")
-                )
-
-                # Normally product name is
-                # directly before the price.
-                if index > 0:
-
-                    candidate = lines[
-                        index - 1
-                    ]
-
-                    # Avoid accidentally selecting
-                    # generic navigation text.
-                    if candidate not in [
-                        "Home",
-                        "Grocery",
-                        "Login",
-                        "Register"
-                    ]:
-                        product_name = candidate
-
-                break
-
-        # Fallback name
-        if not product_name:
-            product_name = (
-                name_from_sitemap
-            )
-
-        # ----------------------------------
-        # AVAILABILITY
-        # ----------------------------------
-
-        lower_text = body_text.lower()
-
-        if "out of stock" in lower_text:
-
-            availability = (
-                "Out of Stock"
-            )
-
-        elif "add to cart" in lower_text:
-
-            availability = (
-                "In Stock"
-            )
-
-        else:
-
-            availability = "Unknown"
-
-        # ----------------------------------
-        # RECORD
-        # ----------------------------------
-
-        return {
-            "store": "keells",
-
-            "product_id": str(itemcode),
-
-            "sku": str(itemcode),
-
-            "product_name": product_name,
-
-            "brand": None,
-
-            "category": None,
-
-            "unit_size": None,
-
-            "uom": None,
-
-            "pack_size": None,
-
-            "price": price,
-
-            "mrp": None,
-
-            "discount": None,
-
-            "inventory": None,
-
-            "availability": availability,
-
-            "is_saleable": (
-                True
-                if availability == "In Stock"
-                else (
-                    False
-                    if availability ==
-                    "Out of Stock"
-                    else None
-                )
-            ),
-
-            "max_order_quantity": None,
-
-            "min_order_quantity": None,
-
-            "image_url": None,
-
-            "web_image_url": None,
-
-            "category_code": None,
-
-            "observed_at": (
-                datetime.now(
-                    SL_TIMEZONE
-                ).isoformat()
-            ),
-
-            "source_url": url,
-
-            "http_status": response.status,
-        }
-
-    except Exception as exc:
-
-        print(
-            f"    ERROR {itemcode}: {exc}"
-        )
-
-        return {
-            "store": "keells",
-            "product_id": str(itemcode),
-            "sku": str(itemcode),
-            "product_name": name_from_sitemap,
-            "price": None,
-            "availability": "Unknown",
-            "observed_at": (
-                datetime.now(
-                    SL_TIMEZONE
-                ).isoformat()
-            ),
-            "source_url": url,
-            "error": str(exc),
-        }
-
-
-async def scrape_keells(
-    max_products=None,
-    request_delay=1.0
-):
-    """
-    Scrape Keells products using a browser.
-
-    max_products:
-        None = all discovered products.
-        Use 10/20 while testing.
-    """
-
-    print("=" * 60)
-    print("KEELLS SCRAPER")
-    print("=" * 60)
-
-    # ----------------------------------
-    # 1. Discover itemcodes
-    # ----------------------------------
-
-    products = discover_itemcodes()
-
-    print(
-        f"Keells itemcodes discovered: "
-        f"{len(products)}"
-    )
-
-    if max_products is not None:
-
-        products = products[
-            :max_products
-        ]
-
-        print(
-            f"Testing first {max_products}"
-        )
-
-    results = []
-
-    # ----------------------------------
-    # 2. Open browser ONCE
-    # ----------------------------------
-
-    async with async_playwright() as p:
-
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
-        )
-
-        context = await browser.new_context(
-            viewport={
-                "width": 1366,
-                "height": 900
-            },
-            user_agent=(
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/153.0.0.0 "
-                "Safari/537.36"
-            ),
-        )
-
-        page = await context.new_page()
-
-        # ----------------------------------
-        # 3. Scrape products
-        # ----------------------------------
-
-        for index, product in enumerate(
-            products,
-            start=1
-        ):
-
-            itemcode = product[
-                "itemcode"
-            ]
-
-            print(
-                f"[{index}/{len(products)}] "
-                f"Itemcode={itemcode}"
-            )
-
-            record = await scrape_product(
-                page,
-                itemcode,
-                product.get(
-                    "name_from_sitemap"
-                )
-            )
-
-            if record:
-
-                results.append(record)
-
-                print(
-                    f"    "
-                    f"{record.get('product_name')} | "
-                    f"Rs {record.get('price')} | "
-                    f"{record.get('availability')}"
-                )
-
-            await asyncio.sleep(
-                request_delay
-            )
-
-        await browser.close()
-
-    print()
-    print(
-        f"Keells records collected: "
-        f"{len(results)}"
-    )
-
-    return results
+        for attempt in range(2):
+            resp = self.session.get(url, params=params, timeout=self.timeout)
+
+            if resp.status_code in (401, 403):
+                logger.warning("Received HTTP %d. Re-authenticating session...", resp.status_code)
+                self.authenticate()
+                continue
+
+            resp.raise_for_status()
+            payload = resp.json()
+
+            if payload.get("statusCode") in (401, 403):
+                logger.warning("Internal status code %d returned. Re-authenticating...", payload.get("statusCode"))
+                self.authenticate()
+                continue
+
+            return payload
+
+        raise RuntimeError(f"Unable to fetch page {page_no} after retry attempts.")
+
+    def run(self, items_per_page: int = 48, max_pages: Optional[int] = None, delay_seconds: float = 0.4) -> List[Dict[str, Any]]:
+        """
+        Executes pagination across the entire store catalog.
+        Returns a normalized record list conforming to the Bronze ingestion layer.
+        """
+        all_records = []
+        current_page = 1
+        total_pages = 1
+        observed_at = datetime.now(SL_TIMEZONE).isoformat()
+
+        logger.info("Initiating full catalog harvest for outlet: %s", self.outlet_code.strip())
+
+        while current_page <= total_pages:
+            payload = self._fetch_page(page_no=current_page, items_per_page=items_per_page)
+
+            detail_result = payload.get("result", {}).get("itemDetailResult", {})
+            total_pages = detail_result.get("pageCount", 1)
+            raw_items = detail_result.get("itemDetails", [])
+
+            if max_pages:
+                total_pages = min(total_pages, max_pages)
+
+            for item in raw_items:
+                raw_price = float(item.get("amount") or 0.0)
+                discount_val = float(item.get("discountValue") or 0.0)
+
+                record = {
+                    "store": "keells",
+                    "product_id": str(item.get("itemID")),
+                    "sku": str(item.get("itemCode")),
+                    "product_name": item.get("name"),
+                    "brand": None,
+                    "category": item.get("categoryCode"),
+                    "unit_size": None,
+                    "uom": item.get("uom"),
+                    "pack_size": None,
+                    "price": raw_price - discount_val if discount_val > 0 else raw_price,
+                    "mrp": raw_price,
+                    "discount": discount_val,
+                    "inventory": float(item.get("stockInHand") or 0.0),
+                    "availability": "In Stock" if bool(item.get("isAvailable")) else "Out of Stock",
+                    "is_saleable": bool(item.get("isSellingToday")),
+                    "observed_at": observed_at,
+                    "source_url": f"https://www.keellssuper.com/product/{item.get('itemCode')}",
+                    "image_url": item.get("imageUrl"),
+                }
+                all_records.append(record)
+
+            logger.info("Scraped Page %d/%d (Total collected: %d)", current_page, total_pages, len(all_records))
+            current_page += 1
+            time.sleep(delay_seconds)
+
+        return all_records
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    scraper = KeellsScraper()
+    data = scraper.run(items_per_page=48, max_pages=None)
 
-    products = asyncio.run(
-        scrape_keells(
-            max_products=10
-        )
-    )
+    # Automatically save snapshot to data/raw/keells/YYYY-MM-DD.json.gz
+    date_str = datetime.now(SL_TIMEZONE).strftime("%Y-%m-%d")
+    output_dir = Path("data/raw/keells")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_file = output_dir / f"{date_str}.json.gz"
 
-    print(
-        f"Finished. Records: {len(products)}"
-    )
+    with gzip.open(out_file, "wt", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+    logger.info("Complete! Saved %d items to %s", len(data), out_file)
