@@ -7,6 +7,9 @@ import time
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 import requests
+from urllib3.util import Retry
+from requests.adapters import HTTPAdapter
+import random
 
 logger = logging.getLogger(__name__)
 SL_TIMEZONE = ZoneInfo("Asia/Colombo")
@@ -148,7 +151,7 @@ class KeellsScraper:
 
             logger.info("Scraped Page %d/%d (Total collected: %d)", current_page, total_pages, len(all_records))
             current_page += 1
-            time.sleep(delay_seconds)
+            time.sleep(random.uniform(1.8, 2.5))
 
         return all_records
 
@@ -168,3 +171,27 @@ if __name__ == "__main__":
         json.dump(data, f, ensure_ascii=False)
 
     logger.info("Complete! Saved %d items to %s", len(data), out_file)
+
+def _get_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.keellssuper.com",
+        "Referer": "https://www.keellssuper.com/",
+    })
+    
+    # Configure retry logic for rate limits and transient server errors
+    retries = Retry(
+        total=5,
+        backoff_factor=2,  # Wait 2s, 4s, 8s, 16s...
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
