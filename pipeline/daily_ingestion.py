@@ -44,7 +44,7 @@ def main():
     # 2. Glomark
     try:
         logger.info("Scraping Glomark...")
-        glomark_data = scrape_glomark(max_products=None)
+        glomark_data = scrape_glomark()
         save_bronze_snapshot("glomark", glomark_data, date_str)
     except Exception as e:
         logger.error("Glomark scraping failed: %s", e)
